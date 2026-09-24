@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Pasillo Oscuro - Terror FPS</title>
+<style>
+*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#000;font-family:Arial,sans-serif}
+canvas{display:block;width:100vw;height:100vh;background:#050608}
+#hud{position:fixed;z-index:5;top:16px;left:18px;right:18px;display:flex;justify-content:space-between;color:#fff;text-shadow:0 2px 8px #000;font-weight:bold;pointer-events:none}
+#cross{position:fixed;z-index:5;left:50%;top:50%;width:14px;height:14px;transform:translate(-50%,-50%);pointer-events:none}
+#cross:before,#cross:after{content:"";position:absolute;background:#ddd;opacity:.75}
+#cross:before{width:14px;height:2px;top:6px}.cross:after{height:14px;width:2px;left:6px}
+#screen{position:fixed;z-index:10;inset:0;background:rgba(0,0,0,.86);display:flex;align-items:center;justify-content:center;text-align:center;color:#fff;padding:20px}
+.panel{max-width:700px}.panel h1{font-size:clamp(38px,7vw,78px);letter-spacing:5px;margin:0 0 15px}.panel p{font-size:18px;line-height:1.65;color:#ccc}.panel button{padding:15px 30px;border:0;border-radius:7px;background:#a31313;color:#fff;font-weight:bold;font-size:17px;cursor:pointer}.panel button:hover{background:#d21c1c}
+#damage{position:fixed;z-index:7;inset:0;background:#b00000;opacity:0;pointer-events:none;transition:opacity .08s}
+#vignette{position:fixed;z-index:4;inset:0;pointer-events:none;background:radial-gradient(circle,transparent 32%,rgba(0,0,0,.55) 75%,#000 100%)}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="vignette"></div><div id="damage"></div>
+<div id="hud"><span>❤️ Vida: <b id="hp">100</b></span><span>🔑 Llaves: <b id="keys">0/3</b></span><span>WASD · Mouse</span></div>
+<div id="cross"><div class="cross"></div></div>
+
+<div id="screen">
+ <div class="panel">
+  <h1>EL PASILLO</h1>
+  <p id="info">
+   Estás encerrado en un edificio abandonado.<br>
+   Encuentra <b>3 llaves</b> y llega a la puerta de salida.<br><br>
+   <b>WASD</b> para moverte · <b>Mouse</b> para mirar<br>
+   El monstruo te está buscando. Si se acerca demasiado, perderás vida.
+  </p>
+  <button id="play">ENTRAR</button><br><br><button id="vr" style="display:none;background:#1769aa">🥽 JUGAR EN QUEST 2</button>
+ </div>
+</div>
+
+
+<script>
+/* Compatibilidad básica con Meta Quest 2 / WebXR */
+let xrSession=null, xrRefSpace=null, xrFrame=null;
+let xrLeft=null, xrRight=null, xrRunning=false;
+
+const vrButton=document.getElementById("vr");
+
+if ("xr" in navigator) {
+  navigator.xr.isSessionSupported("immersive-vr").then(ok=>{
+    if(ok) vrButton.style.display="inline-block";
+  }).catch(()=>{});
+}
+
+vrButton.onclick=async()=>{
+  try{
+    xrSession=await navigator.xr.requestSession("immersive-vr",{optionalFeatures:["local-floor","bounded-floor"]});
+    xrRunning=true;
+    canvas.requestPointerLock?.();
+    xrSession.addEventListener("end",()=>{
+      xrRunning=false; xrSession=null; xrRefSpace=null;
+      vrButton.textContent="🥽 JUGAR EN QUEST 2";
+    });
+    xrLeft=null; xrRight=null;
+    xrSession.addEventListener("inputsourceschange",()=>{
+      xrLeft=null;xrRight=null;
+      for(const src of xrSession.inputSources){
+        if(src.handedness==="left") xrLeft=src;
+        if(src.handedness==="right") xrRight=src;
+      }
+    });
+    xrRefSpace=await xrSession.requestReferenceSpace("local-floor");
+    xrSession.requestAnimationFrame(xrLoop);
+    reset();
+    vrButton.textContent="🥽 QUEST 2 ACTIVO";
+  }catch(e){
+    alert("No se pudo iniciar VR. Abre el juego desde el navegador de Quest 2 usando una conexión segura (HTTPS).");
+  }
+};
+
+function xrLoop(t,frame){
+  if(!xrSession)return;
+  xrFrame=frame;
+
+  // Stick izquierdo: caminar libremente.
+  const sources=xrSession.inputSources;
+  for(const src of sources){
+    const gp=src.gamepad;
+    if(!gp)continue;
+    const ax=gp.axes||[];
+    if(src.handedness==="left"){
+      const x=ax.length>=4?ax[2]:ax[0]||0;
+      const y=ax.length>=4?ax[3]:ax[1]||0;
+      if(Math.abs(x)>.12 || Math.abs(y)>.12){
+        const speed=2.5/72;
+        const forwardX=Math.cos(player.a),forwardY=Math.sin(player.a);
+        const rightX=Math.cos(player.a+Math.PI/2),rightY=Math.sin(player.a+Math.PI/2);
+        const dx=(rightX*x + forwardX*(-y))*speed;
+        const dy=(rightY*x + forwardY*(-y))*speed;
+        if(canMove(player.x+dx,player.y))player.x+=dx;
+        if(canMove(player.x,player.y+dy))player.y+=dy;
+      }
+    }
+
+    // Stick derecho: girar por pasos suaves.
+    if(src.handedness==="right"){
+      const x=ax.length>=4?ax[2]:ax[0]||0;
+      if(Math.abs(x)>.2)player.a+=x*.045;
+    }
+  }
+
+  // Render normal como pantalla plana dentro de la sesión.
+  render();
+  xrSession.requestAnimationFrame(xrLoop);
+}
+</script>
+
+<script>
+const canvas=document.getElementById("game"),ctx=canvas.getContext("2d");
+const screen=document.getElementById("screen"),play=document.getElementById("play");
+const hpEl=document.getElementById("hp"),keysEl=document.getElementById("keys"),damage=document.getElementById("damage");
+
+let W,H,FOV=Math.PI/3,rays=0;
+function resize(){W=canvas.width=innerWidth;H=canvas.height=innerHeight;rays=Math.min(900,W);canvas.style.width=W+"px";canvas.style.height=H+"px"}
+addEventListener("resize",resize);resize();
+
+/* # = pared, . = suelo, K = llave, E = salida, M = monstruo */
+const map=[
+"########################",
+"#........#.............#",
+"#.######.#.###########.#",
+"#.#....#.#.#.........#.#",
+"#.#.##.#.#.#.#######.#.#",
+"#...##...#...#.....#...#",
+"###.######.###.###.#####",
+"#...#......#...#.......#",
+"#.#.#.######.#.#.#####.#",
+"#.#.#........#.#.....#.#",
+"#.#.##########.#####.#.#",
+"#.#.................#..#",
+"#.###############.###.#",
+"#........K.............#",
+"###.###############.####",
+"#...#.................K#",
+"#.#.#.##################",
+"#.#....................#",
+"#.####################.#",
+"#........M...........E.#",
+"########################"
+];
+
+const grid=map.map(r=>r.split(""));
+const MW=grid[0].length,MH=grid.length;
+let player,monster,keys=[],exitPos,playing=false,pressed={},last=0;
+const keyPositions=[];
+
+for(let y=0;y<MH;y++)for(let x=0;x<MW;x++){
+ if(grid[y][x]==="K") keyPositions.push({x:x+.5,y:y+.5,got:false});
+ if(grid[y][x]==="E") exitPos={x:x+.5,y:y+.5};
+ if(grid[y][x]==="M") {monster={x:x+.5,y:y+.5,angle:0};grid[y][x]="."}
+}
+
+function reset(){
+ player={x:2.5,y:1.5,a:0,hp:100};
+ monster.x=8.5;monster.y=19.5;monster.angle=0;
+ keyPositions.forEach(k=>k.got=false);
+ playing=true;updateHUD();
+ screen.style.display="none";
+ canvas.requestPointerLock?.();
+ last=performance.now();
+ requestAnimationFrame(loop);
+}
+play.onclick=reset;
+
+addEventListener("keydown",e=>{pressed[e.key.toLowerCase()]=true;if(e.key==="Escape")document.exitPointerLock?.()});
+addEventListener("keyup",e=>pressed[e.key.toLowerCase()]=false);
+canvas.addEventListener("click",()=>{if(playing)canvas.requestPointerLock?.()});
+document.addEventListener("mousemove",e=>{
+ if(playing && document.pointerLockElement===canvas) player.a+=e.movementX*.0025;
+});
+
+function wall(x,y){
+ const ix=Math.floor(x),iy=Math.floor(y);
+ return ix<0||iy<0||ix>=MW||iy>=MH||grid[iy][ix]==="#";
+}
+function canMove(x,y){
+ const r=.22;
+ return !wall(x-r,y-r)&&!wall(x+r,y-r)&&!wall(x-r,y+r)&&!wall(x+r,y+r);
+}
+function dist(a,b){return Math.hypot(a.x-b.x,a.y-b.y)}
+function updateHUD(){
+ hpEl.textContent=Math.max(0,Math.floor(player?.hp||0));
+ keysEl.textContent=keyPositions.filter(k=>k.got).length+"/3";
+}
+
+function update(dt){
+ let speed=2.8;
+ let dx=0,dy=0;
+ if(pressed["w"]||pressed["arrowup"]){dx+=Math.cos(player.a);dy+=Math.sin(player.a)}
+ if(pressed["s"]||pressed["arrowdown"]){dx-=Math.cos(player.a);dy-=Math.sin(player.a)}
+ if(pressed["a"]){dx+=Math.cos(player.a-Math.PI/2);dy+=Math.sin(player.a-Math.PI/2)}
+ if(pressed["d"]){dx+=Math.cos(player.a+Math.PI/2);dy+=Math.sin(player.a+Math.PI/2)}
+ const len=Math.hypot(dx,dy);
+ if(len){dx=dx/len*speed*dt;dy=dy/len*speed*dt;
+   if(canMove(player.x+dx,player.y))player.x+=dx;
+   if(canMove(player.x,player.y+dy))player.y+=dy;
+ }
+
+ // Recoger llaves
+ keyPositions.forEach(k=>{
+   if(!k.got && Math.hypot(player.x-k.x,player.y-k.y)<.55){
+     k.got=true; updateHUD();
+   }
+ });
+
+ // Monstruo: persecución con movimiento directo y ligera predicción
+ const md=dist(player,monster);
+ const chaseSpeed=md<6?1.55:0.75;
+ const ang=Math.atan2(player.y-monster.y,player.x-monster.x);
+ monster.angle=ang;
+ let mx=Math.cos(ang)*chaseSpeed*dt,my=Math.sin(ang)*chaseSpeed*dt;
+ if(canMove(monster.x+mx,monster.y))monster.x+=mx;
+ if(canMove(monster.x,monster.y+my))monster.y+=my;
+
+ if(md<1.0){
+   player.hp-=30*dt;
+   damage.style.opacity=Math.min(.45,(1.05-md)*.6);
+   updateHUD();
+   if(player.hp<=0){lose();return}
+ }else damage.style.opacity=0;
+
+ if(keyPositions.every(k=>k.got) && dist(player,exitPos)<.7){win();return}
+}
+
+function castRay(angle){
+ let sin=Math.sin(angle),cos=Math.cos(angle),d=0,step=.035;
+ while(d<30){
+   d+=step;
+   let x=player.x+cos*d,y=player.y+sin*d;
+   if(wall(x,y))return d;
+ }
+ return 30;
+}
+
+function render(){
+ ctx.fillStyle="#080b10";ctx.fillRect(0,0,W,H/2);
+ const sky=ctx.createLinearGradient(0,0,0,H/2);sky.addColorStop(0,"#111923");sky.addColorStop(1,"#050608");
+ ctx.fillStyle=sky;ctx.fillRect(0,0,W,H/2);
+ const floor=ctx.createLinearGradient(0,H/2,0,H);floor.addColorStop(0,"#171515");floor.addColorStop(1,"#030303");
+ ctx.fillStyle=floor;ctx.fillRect(0,H/2,W,H/2);
+
+ const z=[];
+ for(let i=0;i<rays;i++){
+   const cam=(i/(rays-1)-.5)*FOV;
+   const a=player.a+cam,d=castRay(a);
+   const corrected=d*Math.cos(cam);
+   const h=Math.min(H*2,H/(corrected*.72));
+   const x=i*W/rays;
+   const shade=Math.max(12,Math.min(100,95-corrected*4));
+   ctx.fillStyle=`rgb(${shade},${shade},${shade+3})`;
+   ctx.fillRect(x,(H-h)/2,W/rays+1,h);
+   z[i]=corrected;
+ }
+ renderObjects(z);
+}
+
+function renderObjects(z){
+ const objects=[];
+ keyPositions.forEach(k=>{if(!k.got)objects.push({x:k.x,y:k.y,type:"key"})});
+ objects.push({x:exitPos.x,y:exitPos.y,type:"exit"});
+ objects.push({x:monster.x,y:monster.y,type:"monster"});
+ objects.sort((a,b)=>dist(b,player)-dist(a,player));
+
+ objects.forEach(o=>{
+   const dx=o.x-player.x,dy=o.y-player.y;
+   const d=Math.hypot(dx,dy);
+   let rel=Math.atan2(dy,dx)-player.a;
+   while(rel>Math.PI)rel-=2*Math.PI;while(rel<-Math.PI)rel+=2*Math.PI;
+   if(Math.abs(rel)>FOV*.65)return;
+   const sx=W/2+(rel/FOV)*W;
+   const size=Math.min(H*1.2,H/(d*.8));
+   const center=Math.floor((sx/W)*rays);
+   if(z[center] && d>z[center]+.15)return;
+
+   if(o.type==="monster"){
+     ctx.save();ctx.translate(sx,H/2);
+     const s=size;
+     ctx.fillStyle="#030303";ctx.beginPath();ctx.ellipse(0,0,s*.23,s*.55,0,0,Math.PI*2);ctx.fill();
+     ctx.beginPath();ctx.arc(0,-s*.42,s*.25,0,Math.PI*2);ctx.fill();
+     ctx.fillStyle="#e31818";ctx.shadowColor="#f00";ctx.shadowBlur=18;
+     ctx.beginPath();ctx.arc(-s*.09,-s*.45,s*.035,0,Math.PI*2);ctx.fill();
+     ctx.beginPath();ctx.arc(s*.09,-s*.45,s*.035,0,Math.PI*2);ctx.fill();
+     ctx.restore();
+   }else if(o.type==="key"){
+     ctx.save();ctx.translate(sx,H/2-size*.15);ctx.scale(size/90,size/90);
+     ctx.fillStyle="#ffd447";ctx.shadowColor="#ffe98a";ctx.shadowBlur=12;
+     ctx.beginPath();ctx.arc(0,0,13,0,Math.PI*2);ctx.fill();
+     ctx.fillRect(10,-4,35,8);ctx.fillRect(30,4,8,10);ctx.fillRect(20,4,8,7);
+     ctx.restore();
+   }else{
+     ctx.save();ctx.translate(sx,H/2);ctx.fillStyle="#7b0d0d";ctx.fillRect(-size*.18,-size*.45,size*.36,size*.9);
+     ctx.fillStyle="#ddd";ctx.font=`bold ${Math.max(12,size*.12)}px Arial`;ctx.textAlign="center";ctx.fillText("SALIDA",0,0);
+     ctx.restore();
+   }
+ });
+}
+
+function loop(t){
+ if(!playing)return;
+ const dt=Math.min(.035,(t-last)/1000);last=t;
+ update(dt);render();
+ requestAnimationFrame(loop);
+}
+
+function endMessage(winState){
+ playing=false;document.exitPointerLock?.();damage.style.opacity=0;
+ screen.style.display="flex";
+ document.querySelector(".panel h1").textContent=winState?"🏆 ¡ESCAPASTE!":"💀 ¡TE ATRAPÓ!";
+ document.getElementById("info").innerHTML=winState
+   ?"Encontraste las 3 llaves y llegaste a la salida.<br><br><b>Ganaste.</b>"
+   :"El monstruo te alcanzó.<br><br><b>La casa se quedó en silencio...</b>";
+ play.textContent="JUGAR DE NUEVO";
+}
+function win(){endMessage(true)}
+function lose(){endMessage(false)}
+</script>
+</body>
+</html>
